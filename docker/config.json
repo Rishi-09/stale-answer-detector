@@ -25,6 +25,8 @@
       "enabled": true,
       "path": "/app/data/plugins/staledetector.so",
       "config": {
+        "enabled": true,
+        "dogfood_log_path": "/app/data/logs/dogfood.jsonl",
         "mode": "async",
         "categories": ["pricing", "api_version", "regulation", "company"],
         "tavily_api_key": "env.TAVILY_API_KEY",
@@ -36,7 +38,8 @@
           "max_response_chars": 8000,
           "queue_size": 256,
           "workers": 4,
-          "tavily_credits_per_hour": 200
+          "tavily_credits_per_hour": 200,
+          "tavily_credits_per_day": 400
         },
         "timeouts_ms": {
           "extractor": 2500,

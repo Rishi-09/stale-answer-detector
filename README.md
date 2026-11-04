@@ -21,6 +21,10 @@ make up
 
 The gateway starts on `http://localhost:8080` with the built-in `mocker` serving canned responses, so you can test end-to-end immediately without needing any live API keys.
 
+For live providers and web verification, copy `.env.example` to `.env`, then add your
+`TAVILY_API_KEY` and the relevant provider key (such as `OPENAI_API_KEY`). The local `.env` file
+is ignored by Git.
+
 ### 2. Send a Test Request
 Send a chat completion request:
 
@@ -155,6 +159,8 @@ The score $S \in [0, 1]$ represents confidence that a claim is current:
       "path": "/app/data/plugins/staledetector.so",
       "config": {
         "mode": "async",
+        "enabled": true,
+        "dogfood_log_path": "logs/dogfood.jsonl",
         "categories": ["pricing", "api_version", "regulation", "company"],
         "tavily_api_key": "env.TAVILY_API_KEY",
         "extractor_model": "openai/gpt-4o-mini",
@@ -165,7 +171,8 @@ The score $S \in [0, 1]$ represents confidence that a claim is current:
           "max_response_chars": 8000,
           "queue_size": 256,
           "workers": 4,
-          "tavily_credits_per_hour": 200
+          "tavily_credits_per_hour": 200,
+          "tavily_credits_per_day": 400
         },
         "timeouts_ms": {
           "extractor": 2500,
@@ -199,6 +206,8 @@ The score $S \in [0, 1]$ represents confidence that a claim is current:
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `mode` | string | `"async"` | Operational mode: `"async"` (zero added latency) or `"strict"` (sync under deadline). |
+| `enabled` | bool | `true` | Kill switch; when `false`, the plugin immediately passes all traffic through. |
+| `dogfood_log_path` | string | `"logs/dogfood.jsonl"` | JSONL path for aggregate operational telemetry. Set to `""` to disable local log writes. |
 | `categories` | list | `["pricing", ...]` | Enabled factual categories to monitor. |
 | `tavily_api_key` | string | `""` | Tavily API key or `env.TAVILY_API_KEY` reference. |
 | `extractor_model` | string | `"openai/gpt-4o-mini"` | Model used for Tier 2 structured claim extraction. |
@@ -209,10 +218,20 @@ The score $S \in [0, 1]$ represents confidence that a claim is current:
 | `limits.queue_size` | int | `256` | Capacity of bounded async worker queue. |
 | `limits.workers` | int | `4` | Concurrency of background verification workers. |
 | `limits.tavily_credits_per_hour` | int | `200` | Sliding-window credit cap preventing cost overruns. |
+| `limits.tavily_credits_per_day` | int | `400` | Rolling 24-hour Tavily credit cap for bounded multi-day runs. |
 | `timeouts_ms.strict_total` | int | `3000` | Deadline in strict mode before falling open to async. |
 | `circuit_breaker.failures` | int | `5` | Consecutive failures before opening circuit. |
 | `circuit_breaker.cooldown_s` | int | `60` | Cooldown period before half-open probe. |
 | `privacy.redact` | list | `["email", "phone", "secret"]` | Sensitive entities scrubbed prior to dispatch. |
+
+---
+
+## Live Test Runbook
+
+For a 3–5 day async dogfood run, including the approved-traffic boundary, daily 20-question
+comparison batch, budget caps, manual review, and README evidence generation, see
+[docs/live-test.md](docs/live-test.md). The default Docker configuration persists its local
+telemetry at `logs/dogfood.jsonl`; that directory is ignored by Git.
 
 ---
 

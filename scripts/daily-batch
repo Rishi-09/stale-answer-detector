@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Run a public freshness-sensitive comparison batch through an OpenAI-compatible gateway."""
+
+import argparse
+import json
+import sys
+import urllib.error
+import urllib.request
+
+QUESTIONS = [
+    "What is the current input price for GPT-4o?",
+    "What is the latest stable Python release?",
+    "What is the latest stable Go release?",
+    "What is the latest Kubernetes release?",
+    "What is the current Node.js LTS version?",
+    "Who is the CEO of Microsoft?",
+    "Who is the CEO of Alphabet?",
+    "Who is the CEO of Amazon?",
+    "Who is the CEO of Apple?",
+    "Who is the CEO of Nvidia?",
+    "When do EU AI Act obligations apply?",
+    "What is the current status of the EU AI Act?",
+    "What are the current OpenAI API rate limits?",
+    "What is the current Anthropic API pricing?",
+    "What is the current AWS Lambda free tier allowance?",
+    "What is the current GitHub Actions free tier allowance?",
+    "What is the latest PostgreSQL major version?",
+    "What is the latest Rust stable release?",
+    "What is the latest Java LTS release?",
+    "What is the current GDPR enforcement authority structure?",
+]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-url", required=True, help="Gateway base URL, for example http://localhost:8080")
+    parser.add_argument("--models", required=True, help="Comma-separated list of 2 or 3 model IDs")
+    parser.add_argument("--api-key", default="", help="Optional gateway bearer token")
+    parser.add_argument("--timeout", type=float, default=60, help="Per-request timeout in seconds")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    models = [model.strip() for model in args.models.split(",") if model.strip()]
+    if not 2 <= len(models) <= 3:
+        print("--models must contain two or three model IDs", file=sys.stderr)
+        return 2
+
+    endpoint = args.base_url.rstrip("/") + "/v1/chat/completions"
+    failures = 0
+    for model in models:
+        for number, question in enumerate(QUESTIONS, 1):
+            payload = json.dumps({"model": model, "messages": [{"role": "user", "content": question}]}).encode()
+            headers = {"Content-Type": "application/json"}
+            if args.api_key:
+                headers["Authorization"] = "Bearer " + args.api_key
+            request = urllib.request.Request(endpoint, data=payload, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(request, timeout=args.timeout) as response:
+                    if not 200 <= response.status < 300:
+                        raise urllib.error.HTTPError(endpoint, response.status, "unexpected status", response.headers, None)
+                print(f"ok   {model} [{number:02d}/{len(QUESTIONS)}]")
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as err:
+                failures += 1
+                print(f"fail {model} [{number:02d}/{len(QUESTIONS)}]: {err}", file=sys.stderr)
+
+    if failures:
+        print(f"completed with {failures} failed request(s)", file=sys.stderr)
+        return 1
+    print(f"completed {len(QUESTIONS) * len(models)} requests")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

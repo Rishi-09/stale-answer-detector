@@ -102,6 +102,7 @@ type LimitsConfig struct {
 	QueueSize              int `json:"queue_size"`
 	Workers                int `json:"workers"`
 	TavilyCreditsPerHour   int `json:"tavily_credits_per_hour"`
+	TavilyCreditsPerDay    int `json:"tavily_credits_per_day"`
 }
 
 // TimeoutsConfig configures execution deadlines.
@@ -125,6 +126,8 @@ type PrivacyConfig struct {
 
 // Config represents the complete Stale-Answer Detector configuration.
 type Config struct {
+	Enabled          bool                   `json:"enabled"`
+	DogfoodLogPath   string                 `json:"dogfood_log_path"`
 	Mode             string                 `json:"mode"`
 	Categories       []string               `json:"categories"`
 	TavilyAPIKey     string                 `json:"tavily_api_key"`
@@ -142,7 +145,9 @@ type Config struct {
 // DefaultConfig returns safe production defaults.
 func DefaultConfig() Config {
 	return Config{
-		Mode: ModeAsync,
+		Enabled:        true,
+		DogfoodLogPath: "logs/dogfood.jsonl",
+		Mode:           ModeAsync,
 		Categories: []string{
 			CategoryPricing,
 			CategoryAPIVersion,
@@ -159,6 +164,7 @@ func DefaultConfig() Config {
 			QueueSize:              256,
 			Workers:                4,
 			TavilyCreditsPerHour:   200,
+			TavilyCreditsPerDay:    400,
 		},
 		TimeoutsMS: TimeoutsConfig{
 			ExtractorMS:   2500,

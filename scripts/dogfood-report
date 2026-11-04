@@ -1,0 +1,607 @@
+#!/usr/bin/env python3
+"""
+scripts/dogfood-report
+
+Analyzes Stale-Answer Detector dogfood logs (JSONL) and produces:
+1. Aggregate traffic and verification statistics:
+   - Requests seen, candidate rate, verified rate
+   - Claims per response, verdict mix per category
+   - Stale rate per model
+   - Credits per request and per verified claim
+   - Cache hit rate and credits saved
+   - p50 and p95 verification latency
+   - Error and drop rate
+2. Manual review labeling helper:
+   - Samples flagged (50-100) and unflagged (~30) claims
+   - Interactive review CLI to label as true stale, false positive, miss, etc.
+   - Computes precision and false-positive rate from saved labels
+3. Markdown generator:
+   - Formats the README "Real-world run" section strictly from measured data
+"""
+
+import argparse
+import datetime
+import json
+import math
+import os
+import random
+import sys
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Stale-Answer Detector Dogfood Log Reporter & Labeling Helper")
+    parser.add_argument("--log", "-l", default="logs/dogfood.jsonl", help="Path to dogfood JSONL log file")
+    parser.add_argument("--labels", default="logs/dogfood_labels.json", help="Path to manual labels JSON file")
+    parser.add_argument("--label", action="store_true", help="Launch interactive labeling helper")
+    parser.add_argument("--sample-flagged", type=int, default=50, help="Number of flagged claims to sample for review (50-100)")
+    parser.add_argument("--sample-unflagged", type=int, default=30, help="Number of unflagged claims to sample for review (~30)")
+    parser.add_argument("--export-sample", help="Export sampled claims to JSON file for offline labeling")
+    parser.add_argument("--markdown", action="store_true", help="Output README 'Real-world run' Markdown section")
+    parser.add_argument("--json", action="store_true", help="Output aggregate metrics as JSON")
+    return parser.parse_args()
+
+def find_log_file(path):
+    if os.path.exists(path):
+        return path
+    alt = "dogfood.jsonl"
+    if os.path.exists(alt):
+        return alt
+    return path
+
+def find_labels_file(path):
+    if os.path.exists(path):
+        return path
+    alt = "dogfood_labels.json"
+    if os.path.exists(alt):
+        return alt
+    return path
+
+def load_records(log_path):
+    records = []
+    if not os.path.exists(log_path):
+        return records
+    with open(log_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
+
+def load_labels(labels_path):
+    if not os.path.exists(labels_path):
+        return {}
+    try:
+        with open(labels_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_labels(labels_path, labels_data):
+    dir_path = os.path.dirname(labels_path)
+    if dir_path and not os.path.exists(dir_path):
+        os.makedirs(dir_path, exist_ok=True)
+    with open(labels_path, "w", encoding="utf-8") as f:
+        json.dump(labels_data, f, indent=2)
+
+def compute_percentile(values, p):
+    if not values:
+        return 0.0
+    sorted_vals = sorted(values)
+    k = (len(sorted_vals) - 1) * p
+    f = math.floor(k)
+    c = math.ceil(k)
+    if f == c:
+        return float(sorted_vals[int(k)])
+    d0 = sorted_vals[int(f)] * (c - k)
+    d1 = sorted_vals[int(c)] * (k - f)
+    return float(d0 + d1)
+
+def compute_aggregates(records, labels):
+    total_requests = len(records)
+    if total_requests == 0:
+        return None
+
+    reqs_with_candidates = 0
+    reqs_with_verified_claims = 0
+    total_tier1_candidates = 0
+    total_claims = 0
+    total_searches = 0
+    total_credits = 0
+    total_cache_hits = 0
+    total_dropped = 0
+    total_errors = 0
+    latencies = []
+
+    # Category breakdowns: {cat: {"total": int, "current": int, "stale": int, "unverifiable": int}}
+    cat_stats = {
+        "pricing": {"total": 0, "current": 0, "stale": 0, "unverifiable": 0},
+        "api_version": {"total": 0, "current": 0, "stale": 0, "unverifiable": 0},
+        "regulation": {"total": 0, "current": 0, "stale": 0, "unverifiable": 0},
+        "company": {"total": 0, "current": 0, "stale": 0, "unverifiable": 0},
+    }
+
+    # Model breakdowns: {model: {"requests": int, "claims": int, "stale_claims": int, "verified_reqs": int}}
+    model_stats = {}
+
+    all_claims = []
+    unique_claims = {}
+
+    for r in records:
+        tier1 = r.get("tier1_candidates", 0)
+        total_tier1_candidates += tier1
+        if tier1 > 0:
+            reqs_with_candidates += 1
+
+        claims = r.get("claims", [])
+        extracted_count = r.get("claims_extracted", len(claims))
+        total_claims += extracted_count
+        if len(claims) > 0:
+            reqs_with_verified_claims += 1
+
+        model = r.get("model", "unknown")
+        if model not in model_stats:
+            model_stats[model] = {"requests": 0, "claims": 0, "stale_claims": 0, "verified_reqs": 0}
+        model_stats[model]["requests"] += 1
+        model_stats[model]["claims"] += len(claims)
+        if len(claims) > 0:
+            model_stats[model]["verified_reqs"] += 1
+
+        total_searches += r.get("searches_issued", 0)
+        total_credits += r.get("credits_used", 0)
+        total_cache_hits += r.get("cache_hits", 0)
+        if r.get("dropped_jobs", False):
+            total_dropped += 1
+        errs = r.get("errors", [])
+        if errs:
+            total_errors += len(errs)
+
+        lat = r.get("verification_latency_ms", 0)
+        if lat > 0:
+            latencies.append(lat)
+
+        for c in claims:
+            cid = c.get("claim_id", f"{r.get('request_id')}_{len(all_claims)}")
+            c["request_id"] = r.get("request_id")
+            c["model"] = model
+            all_claims.append(c)
+            unique_claims[cid] = c
+
+            cat = c.get("category", "pricing")
+            if cat not in cat_stats:
+                cat_stats[cat] = {"total": 0, "current": 0, "stale": 0, "unverifiable": 0}
+            cat_stats[cat]["total"] += 1
+            verdict = c.get("verdict", "unverifiable")
+            if verdict in cat_stats[cat]:
+                cat_stats[cat][verdict] += 1
+
+            if verdict == "stale":
+                model_stats[model]["stale_claims"] += 1
+
+    # Ratios
+    candidate_rate = reqs_with_candidates / total_requests if total_requests else 0.0
+    verified_rate = reqs_with_verified_claims / total_requests if total_requests else 0.0
+    claims_per_response = total_claims / total_requests if total_requests else 0.0
+    claims_per_verified_response = total_claims / reqs_with_verified_claims if reqs_with_verified_claims else 0.0
+
+    credits_per_request = total_credits / total_requests if total_requests else 0.0
+    credits_per_verified_claim = total_credits / len(all_claims) if all_claims else 0.0
+    cost_per_1000 = credits_per_request * 1000
+
+    total_verification_ops = total_searches + total_cache_hits
+    cache_hit_rate = total_cache_hits / total_verification_ops if total_verification_ops else 0.0
+    credits_saved = total_cache_hits  # 1 credit saved per cache hit
+
+    p50_latency = compute_percentile(latencies, 0.50)
+    p95_latency = compute_percentile(latencies, 0.95)
+    p99_latency = compute_percentile(latencies, 0.99)
+
+    drop_rate = total_dropped / total_requests if total_requests else 0.0
+    error_rate = total_errors / total_requests if total_requests else 0.0
+
+    # Label-based metrics
+    label_metrics = compute_label_metrics(labels)
+
+    return {
+        "total_requests": total_requests,
+        "reqs_with_candidates": reqs_with_candidates,
+        "candidate_rate": candidate_rate,
+        "reqs_with_verified_claims": reqs_with_verified_claims,
+        "verified_rate": verified_rate,
+        "total_claims": total_claims,
+        "claims_per_response": claims_per_response,
+        "claims_per_verified_response": claims_per_verified_response,
+        "cat_stats": cat_stats,
+        "model_stats": model_stats,
+        "total_searches": total_searches,
+        "total_credits": total_credits,
+        "credits_per_request": credits_per_request,
+        "credits_per_verified_claim": credits_per_verified_claim,
+        "cost_per_1000": cost_per_1000,
+        "total_cache_hits": total_cache_hits,
+        "cache_hit_rate": cache_hit_rate,
+        "credits_saved": credits_saved,
+        "p50_latency_ms": p50_latency,
+        "p95_latency_ms": p95_latency,
+        "p99_latency_ms": p99_latency,
+        "total_dropped": total_dropped,
+        "drop_rate": drop_rate,
+        "total_errors": total_errors,
+        "error_rate": error_rate,
+        "label_metrics": label_metrics,
+        "unique_claims": unique_claims,
+    }
+
+def compute_label_metrics(labels):
+    flagged_reviewed = 0
+    true_stale = 0
+    false_positive = 0
+    flagged_unclear = 0
+
+    unflagged_reviewed = 0
+    unflagged_correct = 0
+    unflagged_miss = 0
+    unflagged_unclear = 0
+
+    for cid, entry in labels.items():
+        lbl = entry.get("label")
+        was_flagged = entry.get("was_flagged", False)
+
+        if was_flagged:
+            flagged_reviewed += 1
+            if lbl == "true_stale":
+                true_stale += 1
+            elif lbl == "false_positive":
+                false_positive += 1
+            elif lbl == "unclear":
+                flagged_unclear += 1
+        else:
+            unflagged_reviewed += 1
+            if lbl in ("correct", "true_negative"):
+                unflagged_correct += 1
+            elif lbl in ("miss", "false_negative"):
+                unflagged_miss += 1
+            elif lbl == "unclear":
+                unflagged_unclear += 1
+
+    precision = None
+    fp_rate = None
+    if (true_stale + false_positive) > 0:
+        precision = true_stale / (true_stale + false_positive)
+        fp_rate = false_positive / (true_stale + false_positive)
+
+    miss_rate = None
+    if (unflagged_correct + unflagged_miss) > 0:
+        miss_rate = unflagged_miss / (unflagged_correct + unflagged_miss)
+
+    return {
+        "flagged_reviewed": flagged_reviewed,
+        "true_stale": true_stale,
+        "false_positive": false_positive,
+        "flagged_unclear": flagged_unclear,
+        "precision": precision,
+        "fp_rate": fp_rate,
+        "unflagged_reviewed": unflagged_reviewed,
+        "unflagged_correct": unflagged_correct,
+        "unflagged_miss": unflagged_miss,
+        "unflagged_unclear": unflagged_unclear,
+        "miss_rate": miss_rate,
+    }
+
+def format_console_report(agg):
+    out = []
+    out.append("================================================================================")
+    out.append("               STALE-ANSWER DETECTOR: DOGFOODING AGGREGATE REPORT                ")
+    out.append("================================================================================")
+    out.append(f"Requests Seen:                 {agg['total_requests']:,}")
+    out.append(f"  With Tier 1 Candidates:      {agg['reqs_with_candidates']:,} ({agg['candidate_rate'] * 100:.1f}%)")
+    out.append(f"  With Verified Claims:        {agg['reqs_with_verified_claims']:,} ({agg['verified_rate'] * 100:.1f}%)")
+    out.append(f"Claims Extracted:              {agg['total_claims']:,}")
+    out.append(f"  Average Claims / Response:   {agg['claims_per_response']:.2f}")
+    out.append(f"  Claims / Verified Response:  {agg['claims_per_verified_response']:.2f}")
+    out.append("")
+    out.append("--- CATEGORY BREAKDOWN & VERDICT MIX -------------------------------------------")
+    out.append(f"{'Category':<15} {'Total':<8} {'Stale':<10} {'Current':<10} {'Unverifiable':<12} {'Stale %':<8}")
+    out.append("-" * 70)
+    for cat, s in agg["cat_stats"].items():
+        tot = s["total"]
+        stale = s["stale"]
+        cur = s["current"]
+        unv = s["unverifiable"]
+        pct = (stale / tot * 100) if tot else 0.0
+        out.append(f"{cat:<15} {tot:<8} {stale:<10} {cur:<10} {unv:<12} {pct:>6.1f}%")
+    out.append("")
+    out.append("--- MODEL BREAKDOWN & STALE RATE -----------------------------------------------")
+    out.append(f"{'Model':<25} {'Requests':<10} {'Claims':<8} {'Stale Claims':<14} {'Stale Rate':<10}")
+    out.append("-" * 70)
+    for model, m in agg["model_stats"].items():
+        reqs = m["requests"]
+        clms = m["claims"]
+        stale = m["stale_claims"]
+        rate = (stale / clms * 100) if clms else 0.0
+        out.append(f"{model:<25} {reqs:<10} {clms:<8} {stale:<14} {rate:>8.1f}%")
+    out.append("")
+    out.append("--- CREDITS, COST & CACHE PERFORMANCE -----------------------------------------")
+    out.append(f"Total Tavily Credits Used:     {agg['total_credits']:,}")
+    out.append(f"  Credits / Request:           {agg['credits_per_request']:.3f}")
+    out.append(f"  Credits / Verified Claim:    {agg['credits_per_verified_claim']:.3f}")
+    out.append(f"  Cost / 1,000 Responses:      {agg['cost_per_1000']:.1f} credits (${agg['cost_per_1000'] * 0.005:.2f} est.)")
+    out.append(f"Cache Hits:                    {agg['total_cache_hits']:,}")
+    out.append(f"  Cache Hit Rate:              {agg['cache_hit_rate'] * 100:.1f}%")
+    out.append(f"  Credits Saved:               {agg['credits_saved']:,}")
+    out.append("")
+    out.append("--- OPERATIONAL LATENCY & RELIABILITY ------------------------------------------")
+    out.append(f"Verification Latency p50:      {agg['p50_latency_ms']:.1f} ms")
+    out.append(f"Verification Latency p95:      {agg['p95_latency_ms']:.1f} ms")
+    out.append(f"Verification Latency p99:      {agg['p99_latency_ms']:.1f} ms")
+    out.append(f"Dropped Jobs:                  {agg['total_dropped']:,} ({agg['drop_rate'] * 100:.2f}%)")
+    out.append(f"Processing Errors:             {agg['total_errors']:,} ({agg['error_rate'] * 100:.2f}%)")
+    out.append("")
+    out.append("--- MANUAL REVIEW PRECISION (FROM LABELS) --------------------------------------")
+    lm = agg["label_metrics"]
+    if lm["flagged_reviewed"] > 0:
+        prec_str = f"{lm['precision'] * 100:.1f}%" if lm["precision"] is not None else "N/A"
+        fp_str = f"{lm['fp_rate'] * 100:.1f}%" if lm["fp_rate"] is not None else "N/A"
+        out.append(f"Flagged Claims Reviewed:       {lm['flagged_reviewed']}")
+        out.append(f"  True Stale (Catches):        {lm['true_stale']}")
+        out.append(f"  False Positives:             {lm['false_positive']}")
+        out.append(f"  Unclear:                     {lm['flagged_unclear']}")
+        out.append(f"Precision (Real Traffic):      {prec_str}")
+        out.append(f"False-Positive Rate:           {fp_str}")
+        if lm["unflagged_reviewed"] > 0:
+            miss_str = f"{lm['miss_rate'] * 100:.1f}%" if lm["miss_rate"] is not None else "N/A"
+            out.append(f"Unflagged Claims Sampled:      {lm['unflagged_reviewed']}")
+            out.append(f"  Confirmed Current:           {lm['unflagged_correct']}")
+            out.append(f"  Misses (False Negatives):    {lm['unflagged_miss']}")
+            out.append(f"  Sample Miss Rate:            {miss_str}")
+    else:
+        out.append("No manual labels recorded yet.")
+        out.append("Run 'scripts/dogfood-report --label' to review sampled claims.")
+    out.append("================================================================================")
+    return "\n".join(out)
+
+def format_markdown_section(agg):
+    lm = agg["label_metrics"]
+    prec_str = f"{lm['precision'] * 100:.1f}%" if lm["precision"] is not None else "N/A (no flagged claims labeled)"
+    fp_str = f"{lm['fp_rate'] * 100:.1f}%" if lm["fp_rate"] is not None else "N/A (no flagged claims labeled)"
+
+    models_list = ", ".join(agg["model_stats"].keys()) if agg["model_stats"] else "gpt-4o-mini, gpt-4o, claude-3-5-sonnet"
+
+    md = f"""## Real-World Run
+
+A dogfooding run was executed on approved live developer traffic and scripted freshness batches routed through the Bifrost dynamic gateway adapter. Values below are calculated from the supplied JSONL log.
+
+### Setup
+- **Duration:** See the timestamp range in the source JSONL log.
+- **Total Requests Evaluated:** {agg['total_requests']:,}
+- **Models Monitored:** {models_list}
+- **Execution Mode:** `async` (zero added latency to caller responses)
+- **Credit Governance:** Hourly cap: 200 credits/hr; Daily cap: 400 credits/day (enforced via [`docs/credits.md`](docs/credits.md))
+- **Redaction:** Full active scrubbing of secrets, emails, and phone numbers before web verification
+
+---
+
+### Real-World Operational Results
+
+| Metric | Real-World Dogfooding Value | Notes |
+| :--- | :--- | :--- |
+| **Requests Seen** | **{agg['total_requests']:,}** | Total LLM gateway completions monitored |
+| **Candidate Share (Tier 1)** | **{agg['candidate_rate'] * 100:.1f}%** ({agg['reqs_with_candidates']:,} reqs) | Fast regex pre-filter eliminated {100 - (agg['candidate_rate'] * 100):.1f}% with zero latency/credits |
+| **Verified Claim Share** | **{agg['verified_rate'] * 100:.1f}%** ({agg['reqs_with_verified_claims']:,} reqs) | Responses containing checkable factual claims |
+| **Claims / Response** | **{agg['claims_per_response']:.2f}** avg ({agg['claims_per_verified_response']:.2f} on verified) | {agg['total_claims']:,} total claims extracted across 4 categories |
+| **Tavily Credits Used** | **{agg['total_credits']:,} credits** | Total recorded search credits; verify daily usage against the configured cap |
+| **Credits / Request** | **{agg['credits_per_request']:.3f}** | Total credits spent across all traffic |
+| **Credits / Verified Claim** | **{agg['credits_per_verified_claim']:.3f}** | Average verification cost per claim |
+| **Cache Hit Rate** | **{agg['cache_hit_rate'] * 100:.1f}%** | Saved **{agg['credits_saved']:,} credits** via bounded LRU + category TTL cache |
+| **p50 Verification Latency** | **{agg['p50_latency_ms']:.0f} ms** | Measured in background worker pool |
+| **p95 Verification Latency** | **{agg['p95_latency_ms']:.0f} ms** | End-to-end Tavily search + grounding verification |
+| **Dropped Jobs Rate** | **{agg['drop_rate'] * 100:.2f}%** ({agg['total_dropped']:,} dropped) | Saturated worker queue failed open safely without blocking caller |
+| **Processing Error Rate** | **{agg['error_rate'] * 100:.2f}%** ({agg['total_errors']:,} errors) | Network timeouts or malformed snippets failed open |
+| **Precision (from Labels)** | **{prec_str}** | Measured by manual review of flagged claims |
+| **False Positive Rate** | **{fp_str}** | Ratio of false alerts identified in manual review |
+
+---
+
+### Stale Rate by Model
+
+| Model | Requests Monitored | Claims Extracted | Stale Claims Flagged | Stale Claim Rate |
+| :--- | :--- | :--- | :--- | :--- |
+"""
+    for model, m in agg["model_stats"].items():
+        reqs = m["requests"]
+        clms = m["claims"]
+        stale = m["stale_claims"]
+        rate = (stale / clms * 100) if clms else 0.0
+        md += f"| `{model}` | {reqs:,} | {clms:,} | {stale:,} | **{rate:.1f}%** |\n"
+
+    md += """
+---
+
+### Reviewed Examples
+
+Add only manually reviewed, redacted examples from this run. Do not claim a catch, false positive,
+or miss until it has a corresponding entry in the label file.
+
+---
+
+### Cost & Economics
+
+- **Total Tavily Credits:** {agg['total_credits']:,} credits over {agg['total_requests']:,} requests
+- **Cost per 1,000 Responses:** **{agg['cost_per_1000']:.1f} credits** (approx. **${agg['cost_per_1000'] * 0.005:.2f}**)
+- **Credits Saved by Cache:** **{agg['credits_saved']:,} credits** ({agg['cache_hit_rate'] * 100:.1f}% hit rate on verified claims)
+
+### Caveats
+- Evaluated on a sample of developer and scripted benchmark traffic; stale rates may vary on domain-specific enterprise queries.
+- Web evidence freshness relies on search engine snippet indexing latency.
+
+### How to Reproduce
+Run the reporting tool directly against any dogfood log:
+```bash
+scripts/dogfood-report --log logs/dogfood.jsonl
+scripts/dogfood-report --markdown
+```
+"""
+    return md
+
+def run_labeling_helper(agg, labels_path, sample_flagged_n, sample_unflagged_n):
+    labels = load_labels(labels_path)
+    unique_claims = agg["unique_claims"]
+
+    flagged_candidates = []
+    unflagged_candidates = []
+
+    for cid, c in unique_claims.items():
+        if cid in labels:
+            continue
+        verdict = c.get("verdict", "unverifiable")
+        score = c.get("freshness_score", 1.0)
+        if verdict == "stale" or score < 0.50:
+            flagged_candidates.append(c)
+        else:
+            unflagged_candidates.append(c)
+
+    random.seed(42)
+    sample_flagged = random.sample(flagged_candidates, min(len(flagged_candidates), sample_flagged_n))
+    sample_unflagged = random.sample(unflagged_candidates, min(len(unflagged_candidates), sample_unflagged_n))
+
+    total_to_review = len(sample_flagged) + len(sample_unflagged)
+    if total_to_review == 0:
+        print("\nAll sampled claims have already been labeled in " + labels_path)
+        print("To review again, delete or backup " + labels_path)
+        return
+
+    print("\n" + "=" * 80)
+    print("           STALE-ANSWER DETECTOR: MANUAL REVIEW LABELING HELPER           ")
+    print("=" * 80)
+    print(f"Sampled {len(sample_flagged)} flagged claims and {len(sample_unflagged)} unflagged claims.")
+    print("Controls:")
+    print("  [s] Stale (True Positive)     - The claim is truly outdated")
+    print("  [f] False Positive            - The claim is actually current or verification was wrong")
+    print("  [c] Correct / True Negative   - (For unflagged) The claim is correctly identified as current")
+    print("  [m] Miss / False Negative     - (For unflagged) The claim was outdated but missed")
+    print("  [u] Unclear                   - Ambiguous or disputed fact")
+    print("  [k] Skip                      - Skip this claim")
+    print("  [q] Save & Quit               - Save progress and compute precision\n")
+
+    reviewed_now = 0
+    items = [(c, True) for c in sample_flagged] + [(c, False) for c in sample_unflagged]
+
+    try:
+        for idx, (c, is_flagged) in enumerate(items, 1):
+            cid = c.get("claim_id", f"claim_{idx}")
+            print("-" * 80)
+            tag = "[FLAGGED AS STALE]" if is_flagged else "[UNFLAGGED / CURRENT]"
+            print(f"Claim {idx}/{len(items)} {tag}")
+            print(f"Category:       {c.get('category')}")
+            print(f"Entity:         {c.get('entity')}")
+            print(f"Attribute:      {c.get('attribute')}")
+            print(f"Value in Text:  {c.get('value_in_answer')}")
+            print(f"Claim Text:     {c.get('text')}")
+            print(f"Plugin Verdict: {c.get('verdict')} (Score: {c.get('freshness_score', 0.0):.2f})")
+            if c.get("corrected_value"):
+                print(f"Proposed Fix:   {c.get('corrected_value')}")
+            if c.get("evidence_url"):
+                print(f"Evidence URL:   {c.get('evidence_url')}")
+
+            while True:
+                choice = input("\nLabel [s/f/c/m/u/k/q]: ").strip().lower()
+                if choice in ("s", "f", "c", "m", "u", "k", "q"):
+                    break
+                print("Invalid input. Choose: s (stale), f (false pos), c (correct), m (miss), u (unclear), k (skip), q (quit)")
+
+            if choice == "q":
+                print("\nSaving progress and quitting...")
+                break
+            if choice == "k":
+                continue
+
+            label_map = {
+                "s": "true_stale",
+                "f": "false_positive",
+                "c": "correct",
+                "m": "miss",
+                "u": "unclear",
+            }
+            assigned = label_map[choice]
+            labels[cid] = {
+                "claim_id": cid,
+                "label": assigned,
+                "was_flagged": is_flagged,
+                "category": c.get("category"),
+                "text": c.get("text"),
+                "verdict": c.get("verdict"),
+                "freshness_score": c.get("freshness_score"),
+                "labeled_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+            save_labels(labels_path, labels)
+            reviewed_now += 1
+
+    except KeyboardInterrupt:
+        print("\nSession interrupted. Saving progress...")
+        save_labels(labels_path, labels)
+
+    print(f"\nSaved {reviewed_now} new labels to {labels_path}.")
+    lm = compute_label_metrics(labels)
+    if lm["flagged_reviewed"] > 0:
+        prec = lm["precision"] * 100 if lm["precision"] is not None else 0.0
+        print(f"\nUpdated Metrics from {lm['flagged_reviewed']} flagged labels:")
+        print(f"  Precision:           {prec:.1f}%")
+        print(f"  False-Positive Rate: {lm['fp_rate'] * 100:.1f}%")
+        if lm["unflagged_reviewed"] > 0:
+            print(f"  Sample Miss Rate:    {lm['miss_rate'] * 100:.1f}%")
+
+def export_samples(agg, out_path, flagged_n, unflagged_n):
+    unique_claims = agg["unique_claims"]
+    flagged = [c for c in unique_claims.values() if c.get("verdict") == "stale" or c.get("freshness_score", 1.0) < 0.50]
+    unflagged = [c for c in unique_claims.values() if c.get("verdict") != "stale" and c.get("freshness_score", 1.0) >= 0.50]
+
+    random.seed(42)
+    sample_f = random.sample(flagged, min(len(flagged), flagged_n))
+    sample_u = random.sample(unflagged, min(len(unflagged), unflagged_n))
+
+    data = {
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "flagged_claims": sample_f,
+        "unflagged_claims": sample_u,
+    }
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    print(f"Exported {len(sample_f)} flagged and {len(sample_u)} unflagged claims to {out_path}")
+
+def main():
+    args = parse_args()
+    log_file = find_log_file(args.log)
+    labels_file = find_labels_file(args.labels)
+
+    records = load_records(log_file)
+    if not records:
+        print(f"Error: No records found in log file '{log_file}'.", file=sys.stderr)
+        print("Tip: Run gateway traffic or 'scripts/daily-batch' to populate dogfood logs.", file=sys.stderr)
+        sys.exit(1)
+
+    labels = load_labels(labels_file)
+    agg = compute_aggregates(records, labels)
+
+    if args.export_sample:
+        export_samples(agg, args.export_sample, args.sample_flagged, args.sample_unflagged)
+        return
+
+    if args.label:
+        run_labeling_helper(agg, labels_file, args.sample_flagged, args.sample_unflagged)
+        return
+
+    if args.markdown:
+        print(format_markdown_section(agg))
+    elif args.json:
+        # Convert set or complex types
+        out_agg = dict(agg)
+        out_agg.pop("unique_claims", None)
+        print(json.dumps(out_agg, indent=2))
+    else:
+        print(format_console_report(agg))
+
+if __name__ == "__main__":
+    main()
+

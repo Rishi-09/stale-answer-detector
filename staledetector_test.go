@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -242,6 +244,98 @@ func TestFailOpen_PanicRecovery(t *testing.T) {
 	outResp, outErr, err := p.PostLLMHook(nil, nil, nil)
 	if err != nil || outErr != nil || outResp != nil {
 		t.Error("expected graceful fail open on nil inputs")
+	}
+}
+
+func TestKillSwitch_EnabledFalse(t *testing.T) {
+	cfg := freshness.DefaultConfig()
+	cfg.Enabled = false
+	p, err := NewPlugin(cfg)
+	if err != nil {
+		t.Fatalf("failed to create plugin: %v", err)
+	}
+	defer p.Cleanup()
+
+	ctx := schemas.NewBifrostContext(context.Background(), nil)
+	resp := createTestChatResponse("req-disabled-1", "GPT-4o costs $5.00 per million tokens.")
+
+	outResp, outErr, err := p.PostLLMHook(ctx, resp, nil)
+	if err != nil || outErr != nil || outResp != resp {
+		t.Fatal("expected immediate pass-through when enabled is false")
+	}
+
+	// Should not enqueue or verify anything
+	if len(p.workerQueue) != 0 {
+		t.Errorf("expected workerQueue to remain empty, got %d", len(p.workerQueue))
+	}
+}
+
+func TestDogfoodLogging(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "dogfood.jsonl")
+
+	cfg := freshness.DefaultConfig()
+	cfg.DogfoodLogPath = logPath
+	cfg.Mode = freshness.ModeAsync
+
+	p, err := NewPlugin(cfg)
+	if err != nil {
+		t.Fatalf("failed to create plugin: %v", err)
+	}
+	defer p.Cleanup()
+
+	ctx := schemas.NewBifrostContext(context.Background(), nil)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-df-zero")
+
+	// 1. Zero candidate request
+	respZero := createTestChatResponse("req-df-zero", "Hello, how can I help you today?")
+	_, _, _ = p.PostLLMHook(ctx, respZero, nil)
+
+	// Check log was written for zero candidate request
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("expected dogfood log file created: %v", err)
+	}
+	if !strings.Contains(string(data), "req-df-zero") {
+		t.Errorf("expected req-df-zero in dogfood log, got: %s", string(data))
+	}
+	if !strings.Contains(string(data), `"tier1_candidates":0`) {
+		t.Errorf("expected tier1_candidates 0 in dogfood log, got: %s", string(data))
+	}
+}
+
+func TestDogfoodLogging_RedactsAllClaimFields(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "dogfood.jsonl")
+	cfg := freshness.DefaultConfig()
+	cfg.DogfoodLogPath = logPath
+	p, err := NewPlugin(cfg)
+	if err != nil {
+		t.Fatalf("failed to create plugin: %v", err)
+	}
+	defer p.Cleanup()
+
+	secret := "person@example.com"
+	p.logRecord(&freshness.VerdictRecord{
+		CheckedAt: time.Now(),
+		Claims: []freshness.Claim{{
+			ClaimID:       "claim-1",
+			Text:          secret,
+			Entity:        secret,
+			Attribute:     secret,
+			ValueInAnswer: secret,
+			CorrectedValue: secret,
+		}},
+	}, "req-redacted", "gpt-4o", "openai", "ignored", 1, nil)
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read dogfood log: %v", err)
+	}
+	if strings.Contains(string(data), secret) {
+		t.Fatalf("dogfood log leaked unredacted claim value: %s", string(data))
+	}
+	if !strings.Contains(string(data), "[REDACTED_EMAIL]") {
+		t.Fatalf("expected redacted value in dogfood log: %s", string(data))
 	}
 }
 

@@ -5,15 +5,18 @@ import (
 	"time"
 )
 
-// BudgetController governs per-response caps and hourly credit spending limits.
+// BudgetController governs per-response caps, hourly credit spending limits, and daily credit caps.
 type BudgetController struct {
 	mu                   sync.Mutex
 	maxClaimsPerResp     int
 	maxSearchesPerResp   int
 	maxResponseChars     int
 	tavilyCreditsPerHour int
-	creditWindowStart    time.Time
-	creditsSpentInWindow int
+	tavilyCreditsPerDay  int
+	creditHourStart      time.Time
+	creditsSpentInHour   int
+	creditDayStart       time.Time
+	creditsSpentInDay    int
 }
 
 // NewBudgetController constructs a budget and rate controller.
@@ -34,35 +37,52 @@ func NewBudgetController(cfg LimitsConfig) *BudgetController {
 	if creditsPerHour <= 0 {
 		creditsPerHour = 200
 	}
+	creditsPerDay := cfg.TavilyCreditsPerDay
+	if creditsPerDay <= 0 {
+		creditsPerDay = 400
+	}
 
+	now := time.Now()
 	return &BudgetController{
 		maxClaimsPerResp:     maxClaims,
 		maxSearchesPerResp:   maxSearches,
 		maxResponseChars:     maxChars,
 		tavilyCreditsPerHour: creditsPerHour,
-		creditWindowStart:    time.Now(),
-		creditsSpentInWindow: 0,
+		tavilyCreditsPerDay:  creditsPerDay,
+		creditHourStart:      now,
+		creditsSpentInHour:   0,
+		creditDayStart:       now,
+		creditsSpentInDay:    0,
 	}
 }
 
-// AllowSearch checks if spending the specified credits is permitted under the hourly budget.
+// AllowSearch checks if spending the specified credits is permitted under both hourly and daily budget caps.
 // If allowed, it records the spend and returns true.
 func (b *BudgetController) AllowSearch(credits int) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	now := time.Now()
-	// Slide window after 1 hour
-	if now.Sub(b.creditWindowStart) >= time.Hour {
-		b.creditWindowStart = now
-		b.creditsSpentInWindow = 0
+	// Slide hourly window
+	if now.Sub(b.creditHourStart) >= time.Hour {
+		b.creditHourStart = now
+		b.creditsSpentInHour = 0
+	}
+	// Slide daily window
+	if now.Sub(b.creditDayStart) >= 24*time.Hour {
+		b.creditDayStart = now
+		b.creditsSpentInDay = 0
 	}
 
-	if b.creditsSpentInWindow+credits > b.tavilyCreditsPerHour {
+	if b.tavilyCreditsPerHour > 0 && b.creditsSpentInHour+credits > b.tavilyCreditsPerHour {
+		return false
+	}
+	if b.tavilyCreditsPerDay > 0 && b.creditsSpentInDay+credits > b.tavilyCreditsPerDay {
 		return false
 	}
 
-	b.creditsSpentInWindow += credits
+	b.creditsSpentInHour += credits
+	b.creditsSpentInDay += credits
 	return true
 }
 
@@ -81,10 +101,16 @@ func (b *BudgetController) MaxChars() int {
 	return b.maxResponseChars
 }
 
-// CreditsSpent returns current spend in the active window.
+// CreditsSpent returns current spend in the active hourly window.
 func (b *BudgetController) CreditsSpent() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.creditsSpentInWindow
+	return b.creditsSpentInHour
 }
 
+// CreditsSpentDay returns current spend in the active daily window.
+func (b *BudgetController) CreditsSpentDay() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.creditsSpentInDay
+}

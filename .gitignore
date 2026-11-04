@@ -1,1 +1,15 @@
 SPEC.md
+.env
+
+# Build artifacts
+build/
+tmp/
+*.so
+
+# Runtime logs and dogfood data (Keep out of git)
+logs/
+*.log
+*.jsonl
+!eval/dataset.jsonl
+dogfood*.jsonl
+dogfood_labels.json

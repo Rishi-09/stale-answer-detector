@@ -15,6 +15,7 @@ services:
     volumes:
       - ./config.json:/app/data/config.json:ro
       - ../build:/app/data/plugins:ro
+      - ../logs:/app/data/logs
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]

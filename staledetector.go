@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,10 +37,45 @@ var defaultPlugin *Plugin
 
 // verificationJob holds the workload passed from the hot path to async workers.
 type verificationJob struct {
-	requestID string
-	model     string
-	text      string
-	cacheID   string
+	requestID       string
+	model           string
+	provider        string
+	text            string
+	cacheID         string
+	tier1Candidates int
+}
+
+// DogfoodClaim records minimal claim data for audit and manual review.
+type DogfoodClaim struct {
+	ClaimID        string  `json:"claim_id"`
+	Text           string  `json:"text"`
+	Category       string  `json:"category"`
+	Entity         string  `json:"entity"`
+	Attribute      string  `json:"attribute"`
+	ValueInAnswer  string  `json:"value_in_answer"`
+	Verdict        string  `json:"verdict"`
+	FreshnessScore float64 `json:"freshness_score"`
+	CorrectedValue string  `json:"corrected_value,omitempty"`
+	EvidenceURL    string  `json:"evidence_url,omitempty"`
+}
+
+// DogfoodLogEntry records one JSONL line per request without prompts or full responses.
+type DogfoodLogEntry struct {
+	Timestamp             string         `json:"timestamp"`
+	RequestID             string         `json:"request_id"`
+	Model                 string         `json:"model"`
+	Provider              string         `json:"provider"`
+	ResponseLength        int            `json:"response_length"`
+	Tier1Candidates       int            `json:"tier1_candidates"`
+	ClaimsExtracted       int            `json:"claims_extracted"`
+	ClaimsByCategory      map[string]int `json:"claims_by_category"`
+	SearchesIssued        int            `json:"searches_issued"`
+	CreditsUsed           int            `json:"credits_used"`
+	CacheHits             int            `json:"cache_hits"`
+	Claims                []DogfoodClaim `json:"claims"`
+	VerificationLatencyMS int64          `json:"verification_latency_ms"`
+	Errors                []string       `json:"errors"`
+	DroppedJobs           bool           `json:"dropped_jobs"`
 }
 
 // Plugin implements Bifrost LLMPlugin and HTTPTransportPlugin.
@@ -50,20 +87,21 @@ type Plugin struct {
 	workerWg     sync.WaitGroup
 	stopSignal   chan struct{}
 	stopped      atomic.Bool
+	logMu        sync.Mutex
 
 	verdictStore sync.Map // map[string]*freshness.VerdictRecord
 	seenRequests sync.Map // map[string]struct{} (deduplication across fallbacks)
 
 	// Prometheus Metrics
-	registry            *prometheus.Registry
-	metricClaimsDet     *prometheus.CounterVec
-	metricClaimsVer     *prometheus.CounterVec
-	metricSearches      *prometheus.CounterVec
-	metricCredits       prometheus.Counter
-	metricCacheHits     prometheus.Counter
-	metricDroppedJobs   prometheus.Counter
-	metricLatency       prometheus.Histogram
-	metricQueueDepth    prometheus.Gauge
+	registry             *prometheus.Registry
+	metricClaimsDet      *prometheus.CounterVec
+	metricClaimsVer      *prometheus.CounterVec
+	metricSearches       *prometheus.CounterVec
+	metricCredits        prometheus.Counter
+	metricCacheHits      prometheus.Counter
+	metricDroppedJobs    prometheus.Counter
+	metricLatency        prometheus.Histogram
+	metricQueueDepth     prometheus.Gauge
 	metricCircuitBreaker prometheus.Gauge
 }
 
@@ -212,6 +250,9 @@ func (p *Plugin) Cleanup() error {
 }
 
 func (p *Plugin) workerLoop(_ int) {
+	defer func() {
+		_ = recover() // Fail-open: every worker goroutine catches unhandled panics
+	}()
 	defer p.workerWg.Done()
 
 	for {
@@ -241,6 +282,7 @@ func (p *Plugin) processAsyncJob(job verificationJob) {
 
 	record, err := p.engine.Process(ctx, job.requestID, job.model, job.text)
 	if err != nil || record == nil {
+		p.logFailure(job, start, err)
 		return
 	}
 
@@ -260,6 +302,9 @@ func (p *Plugin) processAsyncJob(job verificationJob) {
 	// Store record for API lookup
 	p.verdictStore.Store(job.requestID, record)
 
+	// Log Dogfood JSONL record
+	p.logRecord(record, job.requestID, job.model, job.provider, job.text, job.tier1Candidates, nil)
+
 	// Check if any stale claim was found in a cached answer (Semantic Cache Awareness)
 	if job.cacheID != "" {
 		hasStale := false
@@ -272,6 +317,111 @@ func (p *Plugin) processAsyncJob(job verificationJob) {
 		if hasStale {
 			p.evictSemanticCache(job.cacheID)
 		}
+	}
+}
+
+func (p *Plugin) logFailure(job verificationJob, start time.Time, err error) {
+	errMsg := "verification error"
+	if err != nil {
+		errMsg = p.redactForLog(err.Error())
+	}
+	p.writeDogfoodLog(DogfoodLogEntry{
+		Timestamp:             time.Now().UTC().Format(time.RFC3339Nano),
+		RequestID:             job.requestID,
+		Model:                 job.model,
+		Provider:              job.provider,
+		ResponseLength:        len(job.text),
+		Tier1Candidates:       job.tier1Candidates,
+		ClaimsExtracted:       0,
+		ClaimsByCategory:      map[string]int{},
+		SearchesIssued:        0,
+		CreditsUsed:           0,
+		CacheHits:             0,
+		Claims:                []DogfoodClaim{},
+		VerificationLatencyMS: time.Since(start).Milliseconds(),
+		Errors:                []string{errMsg},
+		DroppedJobs:           false,
+	})
+}
+
+func (p *Plugin) logRecord(record *freshness.VerdictRecord, reqID, model, provider, text string, tier1Candidates int, err error) {
+	var errs []string
+	if err != nil {
+		errs = append(errs, p.redactForLog(err.Error()))
+	}
+
+	claimsByCategory := make(map[string]int)
+	cacheHits := 0
+	dogfoodClaims := make([]DogfoodClaim, 0, len(record.Claims))
+	for _, clm := range record.Claims {
+		claimsByCategory[clm.Category]++
+		if clm.FromCache {
+			cacheHits++
+		}
+		evidenceURL := ""
+		if len(clm.Evidence) > 0 {
+			evidenceURL = freshness.Redact(clm.Evidence[0].URL, p.config.Privacy.Redact)
+		}
+		dogfoodClaims = append(dogfoodClaims, DogfoodClaim{
+			ClaimID:        clm.ClaimID,
+			Text:           p.redactForLog(clm.Text),
+			Category:       clm.Category,
+			Entity:         p.redactForLog(clm.Entity),
+			Attribute:      p.redactForLog(clm.Attribute),
+			ValueInAnswer:  p.redactForLog(clm.ValueInAnswer),
+			Verdict:        clm.Verdict,
+			FreshnessScore: clm.FreshnessScore,
+			CorrectedValue: p.redactForLog(clm.CorrectedValue),
+			EvidenceURL:    evidenceURL,
+		})
+	}
+
+	p.writeDogfoodLog(DogfoodLogEntry{
+		Timestamp:             record.CheckedAt.UTC().Format(time.RFC3339Nano),
+		RequestID:             reqID,
+		Model:                 model,
+		Provider:              provider,
+		ResponseLength:        len(text),
+		Tier1Candidates:       tier1Candidates,
+		ClaimsExtracted:       record.Stats.ClaimsDetected,
+		ClaimsByCategory:      claimsByCategory,
+		SearchesIssued:        record.Stats.Searches,
+		CreditsUsed:           record.Stats.CreditsSpent,
+		CacheHits:             cacheHits,
+		Claims:                dogfoodClaims,
+		VerificationLatencyMS: record.Stats.LatencyMS,
+		Errors:                errs,
+		DroppedJobs:           false,
+	})
+}
+
+func (p *Plugin) redactForLog(text string) string {
+	return freshness.Redact(text, p.config.Privacy.Redact)
+}
+
+func (p *Plugin) writeDogfoodLog(entry DogfoodLogEntry) {
+	if p.config.DogfoodLogPath == "" {
+		return
+	}
+	p.logMu.Lock()
+	defer p.logMu.Unlock()
+	defer func() { _ = recover() }()
+
+	dir := filepath.Dir(p.config.DogfoodLogPath)
+	if dir != "" && dir != "." {
+		_ = os.MkdirAll(dir, 0755)
+	}
+
+	f, err := os.OpenFile(p.config.DogfoodLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	data, err := json.Marshal(entry)
+	if err == nil {
+		data = append(data, '\n')
+		_, _ = f.Write(data)
 	}
 }
 
@@ -293,10 +443,16 @@ func (p *Plugin) evictSemanticCache(cacheID string) {
 // LLMPlugin Methods
 
 func (p *Plugin) PreRequestHook(_ *schemas.BifrostContext, _ *schemas.BifrostRequest) error {
+	if !p.config.Enabled {
+		return nil
+	}
 	return nil
 }
 
 func (p *Plugin) PreLLMHook(_ *schemas.BifrostContext, req *schemas.BifrostRequest) (*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error) {
+	if !p.config.Enabled {
+		return req, nil, nil
+	}
 	return req, nil, nil
 }
 
@@ -306,6 +462,11 @@ func (p *Plugin) PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostR
 	defer func() {
 		_ = recover() // Fail-open: never propagate hook panics
 	}()
+
+	// Kill-switch: pass through immediately if plugin disabled
+	if !p.config.Enabled {
+		return resp, bifrostErr, nil
+	}
 
 	// Recursion guard: skip internal extractor/comparator calls
 	if ctx != nil && ctx.Value(recursionKey) != nil {
@@ -318,7 +479,7 @@ func (p *Plugin) PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostR
 	}
 
 	// Extract response text and metadata
-	responseText, model, reqID, cacheID := extractResponseInfo(ctx, resp)
+	responseText, model, provider, reqID, cacheID := extractResponseInfo(ctx, resp)
 	if len(responseText) == 0 {
 		return resp, bifrostErr, nil
 	}
@@ -330,7 +491,32 @@ func (p *Plugin) PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostR
 	}
 
 	// Tier 1 Fast Match Check: microsecond rejection if zero candidates
-	if !freshness.HasCandidates(responseText, p.config.Limits.MaxResponseChars) {
+	allowedCats := make(map[string]bool)
+	for _, c := range p.config.Categories {
+		allowedCats[c] = true
+	}
+	candidates := freshness.DetectCandidates(responseText, p.config.Limits.MaxResponseChars, allowedCats)
+	tier1Count := len(candidates)
+
+	if tier1Count == 0 {
+		// Log dogfood entry for zero candidate response (zero cost)
+		p.writeDogfoodLog(DogfoodLogEntry{
+			Timestamp:             time.Now().UTC().Format(time.RFC3339Nano),
+			RequestID:             reqID,
+			Model:                 model,
+			Provider:              provider,
+			ResponseLength:        len(responseText),
+			Tier1Candidates:       0,
+			ClaimsExtracted:       0,
+			ClaimsByCategory:      map[string]int{},
+			SearchesIssued:        0,
+			CreditsUsed:           0,
+			CacheHits:             0,
+			Claims:                []DogfoodClaim{},
+			VerificationLatencyMS: 0,
+			Errors:                []string{},
+			DroppedJobs:           false,
+		})
 		return resp, bifrostErr, nil
 	}
 
@@ -350,6 +536,7 @@ func (p *Plugin) PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostR
 		if err == nil && record != nil {
 			p.verdictStore.Store(reqID, record)
 			p.annotateStrictResponse(resp, record)
+			p.logRecord(record, reqID, model, provider, responseText, tier1Count, nil)
 			return resp, bifrostErr, nil
 		}
 		// On timeout or error in strict mode: fail open and fall through to async enqueue!
@@ -357,10 +544,12 @@ func (p *Plugin) PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostR
 
 	// Async mode (Default): Non-blocking enqueue to bounded queue
 	job := verificationJob{
-		requestID: reqID,
-		model:     model,
-		text:      responseText,
-		cacheID:   cacheID,
+		requestID:       reqID,
+		model:           model,
+		provider:        provider,
+		text:            responseText,
+		cacheID:         cacheID,
+		tier1Candidates: tier1Count,
 	}
 
 	select {
@@ -369,6 +558,23 @@ func (p *Plugin) PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostR
 	default:
 		// Queue full: drop job and record metric (fail open)
 		p.metricDroppedJobs.Inc()
+		p.writeDogfoodLog(DogfoodLogEntry{
+			Timestamp:             time.Now().UTC().Format(time.RFC3339Nano),
+			RequestID:             reqID,
+			Model:                 model,
+			Provider:              provider,
+			ResponseLength:        len(responseText),
+			Tier1Candidates:       tier1Count,
+			ClaimsExtracted:       0,
+			ClaimsByCategory:      map[string]int{},
+			SearchesIssued:        0,
+			CreditsUsed:           0,
+			CacheHits:             0,
+			Claims:                []DogfoodClaim{},
+			VerificationLatencyMS: 0,
+			Errors:                []string{"worker queue full; job dropped"},
+			DroppedJobs:           true,
+		})
 	}
 
 	return resp, bifrostErr, nil
@@ -401,7 +607,7 @@ func (p *Plugin) annotateStrictResponse(resp *schemas.BifrostResponse, record *f
 	}
 }
 
-func extractResponseInfo(ctx *schemas.BifrostContext, resp *schemas.BifrostResponse) (text, model, reqID, cacheID string) {
+func extractResponseInfo(ctx *schemas.BifrostContext, resp *schemas.BifrostResponse) (text, model, provider, reqID, cacheID string) {
 	if resp.ChatResponse != nil {
 		cr := resp.ChatResponse
 		model = cr.Model
@@ -447,7 +653,20 @@ func extractResponseInfo(ctx *schemas.BifrostContext, resp *schemas.BifrostRespo
 		reqID = fmt.Sprintf("req-%d", time.Now().UnixNano())
 	}
 
-	return text, model, reqID, cacheID
+	// Infer or extract provider name
+	mLower := strings.ToLower(model)
+	switch {
+	case strings.Contains(mLower, "gpt") || strings.Contains(mLower, "o1") || strings.Contains(mLower, "o3"):
+		provider = "openai"
+	case strings.Contains(mLower, "claude"):
+		provider = "anthropic"
+	case strings.Contains(mLower, "gemini"):
+		provider = "google"
+	default:
+		provider = "llm"
+	}
+
+	return text, model, provider, reqID, cacheID
 }
 
 // HTTPTransportPlugin Methods
@@ -460,7 +679,7 @@ func (p *Plugin) HTTPTransportPreAuthHook(_ *schemas.BifrostContext, _ *schemas.
 func (p *Plugin) HTTPTransportPreHook(_ *schemas.BifrostContext, req *schemas.HTTPRequest) (*schemas.HTTPResponse, error) {
 	defer func() { _ = recover() }()
 
-	if req == nil {
+	if !p.config.Enabled || req == nil {
 		return nil, nil
 	}
 
@@ -520,7 +739,7 @@ func (p *Plugin) HTTPTransportPostHook(_ *schemas.BifrostContext, _ *schemas.HTT
 func (p *Plugin) HTTPTransportResponseHeadersHook(ctx *schemas.BifrostContext, _ *schemas.HTTPRequest, resp *schemas.HTTPResponseMetadata) error {
 	defer func() { _ = recover() }()
 
-	if resp == nil {
+	if !p.config.Enabled || resp == nil {
 		return nil
 	}
 
@@ -622,4 +841,3 @@ func HTTPTransportStreamChunkHook(ctx *schemas.BifrostContext, req *schemas.HTTP
 	}
 	return chunk, nil
 }
-
