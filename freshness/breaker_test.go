@@ -53,3 +53,4 @@ func TestCircuitBreaker_StateTransitions(t *testing.T) {
 		t.Errorf("expected Closed after probe success, got %s", cb.State())
 	}
 }
+

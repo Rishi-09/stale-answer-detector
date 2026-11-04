@@ -208,3 +208,4 @@ func computeQueryHash(query string, domains []string, depth string) string {
 	h.Write([]byte(depth))
 	return hex.EncodeToString(h.Sum(nil))
 }
+

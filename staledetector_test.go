@@ -264,3 +264,4 @@ func BenchmarkPostLLMHook_HotPath(b *testing.B) {
 		_, _, _ = p.PostLLMHook(ctx, resp, nil)
 	}
 }
+

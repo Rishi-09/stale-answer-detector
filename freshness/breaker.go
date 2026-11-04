@@ -111,3 +111,4 @@ func (cb *CircuitBreaker) Reset() {
 	cb.failureCount = 0
 	cb.lastStateTime = time.Now()
 }
+

@@ -153,3 +153,4 @@ func HasCandidates(text string, maxChars int) bool {
 func CleanText(s string) string {
 	return strings.TrimSpace(s)
 }
+

@@ -103,3 +103,4 @@ Add the plugin test target to the upstream `Makefile`:
 test-staledetector:
 	cd plugins/staledetector && go test -v -race -cover ./...
 ```
+

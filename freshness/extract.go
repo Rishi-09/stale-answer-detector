@@ -242,3 +242,4 @@ func BuildExtractorPrompt(text string) (string, error) {
 	sb.WriteString("Output JSON array format.")
 	return sb.String(), nil
 }
+

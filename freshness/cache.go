@@ -197,3 +197,4 @@ func (c *ClaimCache) Clear() {
 	c.items = make(map[string]*lruEntry, c.capacity)
 	c.evictionList.Init()
 }
+

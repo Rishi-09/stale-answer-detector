@@ -87,3 +87,4 @@ func (b *BudgetController) CreditsSpent() int {
 	defer b.mu.Unlock()
 	return b.creditsSpentInWindow
 }
+

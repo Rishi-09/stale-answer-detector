@@ -76,3 +76,4 @@ func TestFormatSnippetsForPrompt_InjectionSafety(t *testing.T) {
 		t.Fatal("expected formatted snippet to have closing XML boundary")
 	}
 }
+

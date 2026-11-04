@@ -124,3 +124,4 @@ $$v = 1.0 - \exp\left(-\frac{\Delta t \cdot \ln 2}{H}\right)$$
 - **Hourly Budget Cap:** Limits Tavily credit expenditure (default 200 credits/hour) via atomic sliding-window tracking.
 - **PII & Token Redaction:** Automatically scrubs email addresses, phone numbers, and bearer/API secret tokens before dispatching queries or snippets.
 - **Grounding Defense:** Any proposed `corrected_value` must be physically present in retrieved web snippets. Ungrounded corrections are downgraded to `unverifiable`.
+

@@ -151,3 +151,4 @@ func TestShouldFlag(t *testing.T) {
 		t.Error("expected 0.85 not to be flagged below 0.50")
 	}
 }
+

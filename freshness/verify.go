@@ -162,3 +162,4 @@ func (v *LocalDeterministicVerifier) Verify(_ context.Context, claim Claim) (Ver
 		Authority: 0.85,
 	}, nil
 }
+

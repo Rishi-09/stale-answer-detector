@@ -35,3 +35,4 @@ func TestRedact(t *testing.T) {
 		t.Error("expected [REDACTED_SECRET] placeholder")
 	}
 }
+

@@ -96,3 +96,4 @@ func TestClaimCache_ConcurrentRace(t *testing.T) {
 
 	wg.Wait()
 }
+

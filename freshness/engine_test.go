@@ -89,3 +89,4 @@ func TestEngine_ZeroCandidatesEarlyExit(t *testing.T) {
 		t.Errorf("expected 0 searches, got %d", record.Stats.Searches)
 	}
 }
+

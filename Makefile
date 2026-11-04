@@ -58,3 +58,4 @@ demo: ## Send sample request to gateway to observe freshness headers and verdict
 		-H "Content-Type: application/json" \
 		-H "Authorization: Bearer mock-key" \
 		-d '{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "What is the price of GPT-4o and what is the latest Python version?"}]}'
+

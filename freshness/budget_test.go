@@ -48,3 +48,4 @@ func TestBudgetController_Limits(t *testing.T) {
 		t.Errorf("expected max chars 5000, got %d", budget.MaxChars())
 	}
 }
+

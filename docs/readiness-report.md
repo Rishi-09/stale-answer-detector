@@ -56,3 +56,4 @@
 1. **Non-English Claims:** The Tier 1 regex pre-filter and system prompts are currently optimized for English-language claims.
 2. **Model Knowledge Cutoff Discovery:** Because Bifrost's model catalog does not currently expose cutoff dates per model, cutoffs are configured via `knowledge_cutoffs` map with built-in fallbacks. Upstreaming a knowledge cutoff field in `framework/modelcatalog` would allow automated discovery.
 3. **Automated Answer Rewriting:** Out of scope for this hackathon entry; the current implementation provides corrected values and warnings rather than rewriting the answer in-flight to prevent model voice distortion.
+

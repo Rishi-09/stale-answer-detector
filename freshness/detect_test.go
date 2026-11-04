@@ -136,3 +136,4 @@ func FuzzTier1Detect(f *testing.F) {
 		_ = HasCandidates(text, 8000)
 	})
 }
+

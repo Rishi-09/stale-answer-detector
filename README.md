@@ -240,3 +240,4 @@ Tested on the 60-case benchmark in `eval/dataset.jsonl` (15 per category) across
 ## License
 
 Licensed under the Apache License, Version 2.0. Matches upstream Bifrost gateway.
+

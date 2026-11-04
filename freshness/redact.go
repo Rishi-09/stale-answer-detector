@@ -44,3 +44,4 @@ func Redact(text string, rules []string) string {
 
 	return result
 }
+

@@ -38,3 +38,4 @@ ENV PORT=8080
 EXPOSE 8080
 
 ENTRYPOINT ["/app/bifrost-http", "-app-dir", "/app/data"]
+

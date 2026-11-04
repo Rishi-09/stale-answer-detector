@@ -74,3 +74,4 @@ func TestTavilyClient_ReplayMode(t *testing.T) {
 		t.Errorf("unexpected evidence snippet: %s", evidence[0].Snippet)
 	}
 }
+

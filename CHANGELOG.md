@@ -25,3 +25,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Full fail-open error handling and panic recovery.
 - Docker dynamic build harness (`golang:1.27.3-alpine3.24`) and docker-compose deployment.
 - 60-case evaluation benchmark dataset and runner.
+

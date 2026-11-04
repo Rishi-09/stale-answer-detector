@@ -77,3 +77,4 @@ func TestBuildExtractorPrompt_Delimiters(t *testing.T) {
 		t.Fatal("expected prompt to contain untrusted answer delimiters")
 	}
 }
+
