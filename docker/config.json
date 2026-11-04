@@ -1,0 +1,122 @@
+{
+  "$schema": "https://www.getbifrost.ai/schema",
+  "client": {
+    "enable_logging": true,
+    "initial_pool_size": 1000,
+    "enforce_auth_on_inference": false
+  },
+  "config_store": {
+    "enabled": true,
+    "type": "sqlite",
+    "config": {
+      "path": "/app/data/config.db"
+    }
+  },
+  "logs_store": {
+    "enabled": true,
+    "type": "sqlite",
+    "config": {
+      "path": "/app/data/logs.db"
+    }
+  },
+  "plugins": [
+    {
+      "name": "stale-answer-detector",
+      "enabled": true,
+      "path": "/app/data/plugins/staledetector.so",
+      "config": {
+        "mode": "async",
+        "categories": ["pricing", "api_version", "regulation", "company"],
+        "tavily_api_key": "env.TAVILY_API_KEY",
+        "extractor_model": "openai/gpt-4o-mini",
+        "flag_below": 0.5,
+        "limits": {
+          "max_claims_per_response": 8,
+          "max_searches_per_response": 4,
+          "max_response_chars": 8000,
+          "queue_size": 256,
+          "workers": 4,
+          "tavily_credits_per_hour": 200
+        },
+        "timeouts_ms": {
+          "extractor": 2500,
+          "verify": 4000,
+          "strict_total": 3000
+        },
+        "cache_ttl_hours": {
+          "pricing": 6,
+          "api_version": 24,
+          "company": 72,
+          "regulation": 168
+        },
+        "circuit_breaker": {
+          "failures": 5,
+          "cooldown_s": 60
+        },
+        "privacy": {
+          "redact": ["email", "phone", "secret"],
+          "send_prompt_to_extractor": false
+        },
+        "domain_allowlist": {
+          "pricing": ["openai.com", "anthropic.com", "docs.aws.amazon.com", "cloud.google.com"],
+          "api_version": ["github.com", "python.org", "kubernetes.io"]
+        }
+      }
+    },
+    {
+      "name": "mocker",
+      "enabled": true,
+      "config": {
+        "rules": [
+          {
+            "pattern": ".*",
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "responses": [
+              {
+                "type": "success",
+                "body": {
+                  "id": "chatcmpl-mock-stale",
+                  "object": "chat.completion",
+                  "created": 1730700000,
+                  "model": "gpt-4o-mini",
+                  "choices": [
+                    {
+                      "index": 0,
+                      "message": {
+                        "role": "assistant",
+                        "content": "As of today, GPT-4o input tokens cost $5.00 per million tokens and output tokens cost $15.00 per million tokens. Python 3.9 is the latest stable release."
+                      },
+                      "finish_reason": "stop"
+                    }
+                  ],
+                  "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 34,
+                    "total_tokens": 46
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "providers": {
+    "openai": {
+      "keys": [
+        {
+          "name": "mock-openai",
+          "value": "mock-key",
+          "weight": 1
+        }
+      ],
+      "network_config": {
+        "base_url": "http://localhost:8000",
+        "default_request_timeout_in_seconds": 10,
+        "max_retries": 0
+      }
+    }
+  }
+}

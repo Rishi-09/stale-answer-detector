@@ -1,0 +1,40 @@
+# Dynamic build container for Bifrost Gateway + Stale-Answer Detector Plugin
+# Toolchain: golang:1.27.3-alpine3.24 (Pinned tag: transports/v2.4.0 / core v1.14.1)
+
+FROM golang:1.27.3-alpine3.24@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS builder
+
+RUN apk add --no-cache gcc musl-dev git make bash
+
+WORKDIR /workspace
+
+# Copy Bifrost reference repo and plugin workspace
+COPY . /workspace/bifrost
+COPY stale-answer-detector /workspace/stale-answer-detector
+
+# 1. Build dynamically linked Bifrost HTTP gateway
+WORKDIR /workspace/bifrost/transports/bifrost-http
+RUN CGO_ENABLED=1 GOOS=linux \
+    go build -ldflags="-w -s" -trimpath -o /out/bifrost-http .
+
+# 2. Build Stale-Answer Detector plugin as Linux .so
+WORKDIR /workspace/stale-answer-detector
+RUN mkdir -p /out/plugins && \
+    CGO_ENABLED=1 GOOS=linux \
+    go build -buildmode=plugin -ldflags="-w -s" -trimpath -o /out/plugins/staledetector.so staledetector.go
+
+# Runtime image
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates curl tzdata
+
+WORKDIR /app
+RUN mkdir -p /app/data/plugins /app/data/logs
+
+COPY --from=builder /out/bifrost-http /app/bifrost-http
+COPY --from=builder /out/plugins/staledetector.so /app/data/plugins/staledetector.so
+COPY stale-answer-detector/docker/config.json /app/data/config.json
+
+ENV PORT=8080
+EXPOSE 8080
+
+ENTRYPOINT ["/app/bifrost-http", "-app-dir", "/app/data"]
