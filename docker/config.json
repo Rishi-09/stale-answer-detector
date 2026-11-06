@@ -25,10 +25,12 @@
       "enabled": true,
       "path": "/app/data/plugins/staledetector.so",
       "config": {
+        "enabled": true,
+        "dogfood_log_path": "/app/data/logs/dogfood.jsonl",
         "mode": "async",
         "categories": ["pricing", "api_version", "regulation", "company"],
         "tavily_api_key": "env.TAVILY_API_KEY",
-        "extractor_model": "openai/gpt-4o-mini",
+        "extractor_model": "env.GROQ_MODEL",
         "flag_below": 0.5,
         "limits": {
           "max_claims_per_response": 8,
@@ -36,7 +38,8 @@
           "max_response_chars": 8000,
           "queue_size": 256,
           "workers": 4,
-          "tavily_credits_per_hour": 200
+          "tavily_credits_per_hour": 200,
+          "tavily_credits_per_day": 400
         },
         "timeouts_ms": {
           "extractor": 2500,
@@ -70,8 +73,39 @@
         "rules": [
           {
             "pattern": ".*",
+            "provider": "groq",
+            "model": ".*",
+            "responses": [
+              {
+                "type": "success",
+                "body": {
+                  "id": "chatcmpl-mock-groq-stale",
+                  "object": "chat.completion",
+                  "created": 1730700000,
+                  "model": "llama-3.3-70b-versatile",
+                  "choices": [
+                    {
+                      "index": 0,
+                      "message": {
+                        "role": "assistant",
+                        "content": "As of today, GPT-4o input tokens cost $5.00 per million tokens and output tokens cost $15.00 per million tokens. Python 3.9 is the latest stable release."
+                      },
+                      "finish_reason": "stop"
+                    }
+                  ],
+                  "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 34,
+                    "total_tokens": 46
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "pattern": ".*",
             "provider": "openai",
-            "model": "gpt-4o-mini",
+            "model": ".*",
             "responses": [
               {
                 "type": "success",
@@ -104,6 +138,20 @@
     }
   ],
   "providers": {
+    "groq": {
+      "keys": [
+        {
+          "name": "groq-key",
+          "value": "env.GROQ_API_KEY",
+          "weight": 1
+        }
+      ],
+      "network_config": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "default_request_timeout_in_seconds": 30,
+        "max_retries": 2
+      }
+    },
     "openai": {
       "keys": [
         {

@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""
+scripts/daily-batch
+
+Executes a scripted daily batch of 20 freshness-sensitive questions
+(pricing, versions, corporate leaders, regulations) across 2 or 3 models.
+Designed for self-hosted Bifrost gateways with Bring-Your-Own-Keys (BYOK),
+and includes a --mock mode for zero-dependency local testing.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+QUESTIONS = [
+    # 1. Pricing
+    "What is the current input price for GPT-4o?",
+    "What is the current Anthropic API pricing for Claude 3.5 Sonnet?",
+    "What is the current Google Gemini 1.5 Pro pricing per million tokens?",
+    "What is the current AWS Lambda free tier allowance?",
+    "What is the current GitHub Actions free tier allowance?",
+
+    # 2. API Versions
+    "What is the latest stable Python release?",
+    "What is the latest stable Go release?",
+    "What is the latest Kubernetes release?",
+    "What is the current Node.js LTS version?",
+    "What is the latest React major release?",
+
+    # 3. Leaders & Corporate Facts
+    "Who is the current CEO of Twitter / X Corp?",
+    "Who is the CEO of OpenAI?",
+    "Who is the CEO of Anthropic?",
+    "Who is the CEO of Microsoft?",
+    "Who is the CEO of Google DeepMind?",
+
+    # 4. Regulations
+    "When do EU AI Act obligations apply?",
+    "What is the current status of the EU AI Act?",
+    "What is the statutory fine limit under GDPR?",
+    "What are the reporting thresholds under the US Executive Order on AI?",
+    "What is the current legal status of the FTC non-compete clause ban?",
+]
+
+MOCK_RECORDS = [
+    {
+        "category": "pricing",
+        "claim": "GPT-4o costs $5.00 per million tokens",
+        "entity": "GPT-4o",
+        "attr": "input price",
+        "val": "$5.00 per million",
+        "verdict": "stale",
+        "score": 0.11,
+        "fix": "$2.50 per million",
+        "evidence": "https://openai.com/pricing"
+    },
+    {
+        "category": "api_version",
+        "claim": "Python latest stable release is 3.11",
+        "entity": "Python",
+        "attr": "version",
+        "val": "3.11",
+        "verdict": "stale",
+        "score": 0.14,
+        "fix": "Python 3.12",
+        "evidence": "https://python.org/downloads"
+    },
+    {
+        "category": "company",
+        "claim": "Elon Musk is the CEO of Twitter",
+        "entity": "Twitter",
+        "attr": "CEO",
+        "val": "Elon Musk",
+        "verdict": "stale",
+        "score": 0.15,
+        "fix": "Linda Yaccarino",
+        "evidence": "https://reuters.com/technology"
+    },
+    {
+        "category": "regulation",
+        "claim": "EU AI Act obligations take effect in late 2026",
+        "entity": "EU AI Act",
+        "attr": "enforcement date",
+        "val": "late 2026",
+        "verdict": "stale",
+        "score": 0.18,
+        "fix": "February 2025",
+        "evidence": "https://europa.eu/ai-act"
+    },
+    {
+        "category": "api_version",
+        "claim": "Go 1.23 is the latest release",
+        "entity": "Go",
+        "attr": "version",
+        "val": "1.23",
+        "verdict": "current",
+        "score": 0.94,
+        "fix": "",
+        "evidence": "https://go.dev/doc/devel/release"
+    },
+]
+
+
+def parse_args():
+    default_groq = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    default_models = f"{default_groq},llama-3.1-8b-instant"
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-url", default="http://localhost:8080", help="Self-hosted gateway base URL (default: http://localhost:8080)")
+    parser.add_argument("--models", default=default_models, help=f"Comma-separated list of 2 or 3 model IDs (default: {default_models})")
+    parser.add_argument("--api-key", default=os.getenv("GROQ_API_KEY", os.getenv("BIFROST_API_KEY", "mock-key")), help="Optional gateway bearer token")
+    parser.add_argument("--timeout", type=float, default=60, help="Per-request timeout in seconds")
+    parser.add_argument("--mock", action="store_true", help="Simulate batch locally and generate sample dogfood logs for testing")
+    parser.add_argument("--output", default="logs/dogfood.jsonl", help="Path to write/append dogfood log entries (default: logs/dogfood.jsonl)")
+    return parser.parse_args()
+
+
+def simulate_dogfood_batch(models, output_path):
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    count = 0
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with open(output_path, "a", encoding="utf-8") as f:
+        for model in models:
+            for i, q in enumerate(QUESTIONS):
+                count += 1
+                req_id = f"df-batch-{model}-{i+1}-{int(time.time())}"
+                mock_item = MOCK_RECORDS[i % len(MOCK_RECORDS)]
+
+                m_lower = model.lower()
+                provider = "groq"
+                if "gpt" in m_lower or "o1" in m_lower or "o3" in m_lower:
+                    provider = "openai"
+                elif "claude" in m_lower:
+                    provider = "anthropic"
+
+                # Build realistic dogfood log entry
+                is_candidate = (i % 5 != 0) # 80% have candidates in freshness batch
+                if not is_candidate:
+                    entry = {
+                        "timestamp": (now - datetime.timedelta(minutes=count * 3)).isoformat(),
+                        "request_id": req_id,
+                        "model": model,
+                        "provider": provider,
+                        "response_length": 180,
+                        "tier1_candidates": 0,
+                        "claims_extracted": 0,
+                        "claims_by_category": {},
+                        "searches_issued": 0,
+                        "credits_used": 0,
+                        "cache_hits": 0,
+                        "claims": [],
+                        "verification_latency_ms": 0,
+                        "errors": [],
+                        "dropped_jobs": False
+                    }
+                else:
+                    is_cached = (i % 3 == 0)
+                    searches = 0 if is_cached else 1
+                    credits_used = 0 if is_cached else 1
+                    cache_hits = 1 if is_cached else 0
+
+                    entry = {
+                        "timestamp": (now - datetime.timedelta(minutes=count * 3)).isoformat(),
+                        "request_id": req_id,
+                        "model": model,
+                        "provider": provider,
+                        "response_length": 340,
+                        "tier1_candidates": 2,
+                        "claims_extracted": 1,
+                        "claims_by_category": {mock_item["category"]: 1},
+                        "searches_issued": searches,
+                        "credits_used": credits_used,
+                        "cache_hits": cache_hits,
+                        "claims": [
+                            {
+                                "claim_id": f"clm_{req_id}",
+                                "text": mock_item["claim"],
+                                "category": mock_item["category"],
+                                "entity": mock_item["entity"],
+                                "attribute": mock_item["attr"],
+                                "value_in_answer": mock_item["val"],
+                                "verdict": mock_item["verdict"],
+                                "freshness_score": mock_item["score"],
+                                "corrected_value": mock_item["fix"],
+                                "evidence_url": mock_item["evidence"]
+                            }
+                        ],
+                        "verification_latency_ms": 12 if is_cached else 780,
+                        "errors": [],
+                        "dropped_jobs": False
+                    }
+                f.write(json.dumps(entry) + "\n")
+                print(f"simulated {model} [{i+1:02d}/{len(QUESTIONS)}] -> {entry['claims'][0]['verdict'] if entry['claims'] else 'zero-candidate'}")
+
+    print(f"\nSuccessfully generated {count} dogfood telemetry records in '{output_path}'.")
+    return 0
+
+
+def main():
+    args = parse_args()
+    models = [model.strip() for model in args.models.split(",") if model.strip()]
+    if not 2 <= len(models) <= 3:
+        print("--models must contain two or three model IDs", file=sys.stderr)
+        return 2
+
+    if args.mock:
+        print(f"Running scripted daily batch in MOCK mode for models: {', '.join(models)}")
+        return simulate_dogfood_batch(models, args.output)
+
+    endpoint = args.base_url.rstrip("/") + "/v1/chat/completions"
+    failures = 0
+    for model in models:
+        for number, question in enumerate(QUESTIONS, 1):
+            payload = json.dumps({"model": model, "messages": [{"role": "user", "content": question}]}).encode()
+            headers = {"Content-Type": "application/json"}
+            if args.api_key:
+                headers["Authorization"] = "Bearer " + args.api_key
+            request = urllib.request.Request(endpoint, data=payload, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(request, timeout=args.timeout) as response:
+                    if not 200 <= response.status < 300:
+                        raise urllib.error.HTTPError(endpoint, response.status, "unexpected status", response.headers, None)
+                print(f"ok   {model} [{number:02d}/{len(QUESTIONS)}]")
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as err:
+                failures += 1
+                print(f"fail {model} [{number:02d}/{len(QUESTIONS)}]: {err}", file=sys.stderr)
+
+    if failures:
+        print(f"completed with {failures} failed request(s)", file=sys.stderr)
+        return 1
+    print(f"completed {len(QUESTIONS) * len(models)} requests")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
