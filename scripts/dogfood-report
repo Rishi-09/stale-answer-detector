@@ -416,7 +416,7 @@ A dogfooding run was executed on approved live developer traffic and scripted fr
         rate = (stale / clms * 100) if clms else 0.0
         md += f"| `{model}` | {reqs:,} | {clms:,} | {stale:,} | **{rate:.1f}%** |\n"
 
-    md += """
+    md += f"""
 ---
 
 ### Reviewed Examples

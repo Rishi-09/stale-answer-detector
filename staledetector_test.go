@@ -339,6 +339,41 @@ func TestDogfoodLogging_RedactsAllClaimFields(t *testing.T) {
 	}
 }
 
+func TestDynamicGroqModelConfiguration(t *testing.T) {
+	t.Setenv("GROQ_MODEL", "llama-3.1-8b-instant")
+	t.Setenv("GROQ_API_KEY", "gsk-mock-key")
+
+	cfg := freshness.DefaultConfig()
+	p, err := NewPlugin(cfg)
+	if err != nil {
+		t.Fatalf("failed to create plugin: %v", err)
+	}
+	defer p.Cleanup()
+
+	if p.config.ExtractorModel != "groq/llama-3.1-8b-instant" {
+		t.Errorf("expected extractor model 'groq/llama-3.1-8b-instant', got '%s'", p.config.ExtractorModel)
+	}
+
+	// Test Groq provider detection
+	ctx := schemas.NewBifrostContext(context.Background(), nil)
+	resp := createTestChatResponse("req-groq-test", "Python 3.12 is released.")
+	resp.ChatResponse.Model = "llama-3.3-70b-versatile"
+
+	text, model, provider, reqID, _ := extractResponseInfo(ctx, resp)
+	if provider != "groq" {
+		t.Errorf("expected provider 'groq', got '%s'", provider)
+	}
+	if model != "llama-3.3-70b-versatile" {
+		t.Errorf("expected model 'llama-3.3-70b-versatile', got '%s'", model)
+	}
+	if reqID != "req-groq-test" {
+		t.Errorf("expected reqID 'req-groq-test', got '%s'", reqID)
+	}
+	if text != "Python 3.12 is released." {
+		t.Errorf("expected text 'Python 3.12 is released.', got '%s'", text)
+	}
+}
+
 func BenchmarkPostLLMHook_HotPath(b *testing.B) {
 	p, err := NewPlugin(freshness.DefaultConfig())
 	if err != nil {

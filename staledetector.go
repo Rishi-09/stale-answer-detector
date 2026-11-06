@@ -157,6 +157,28 @@ func NewPlugin(cfg freshness.Config) (*Plugin, error) {
 
 	reg.MustRegister(claimsDet, claimsVer, searches, credits, cacheHits, droppedJobs, latency, queueDepth, cbState)
 
+	// Dynamically resolve Groq Model & Extractor Model from environment
+	if groqModel := os.Getenv("GROQ_MODEL"); groqModel != "" {
+		if !strings.HasPrefix(groqModel, "groq/") {
+			cfg.ExtractorModel = "groq/" + groqModel
+		} else {
+			cfg.ExtractorModel = groqModel
+		}
+	} else if strings.HasPrefix(cfg.ExtractorModel, "env.") {
+		envVar := strings.TrimPrefix(cfg.ExtractorModel, "env.")
+		if val := os.Getenv(envVar); val != "" {
+			cfg.ExtractorModel = val
+		}
+	}
+
+	// Resolve Tavily API key from environment if prefixed with env. or empty
+	if strings.HasPrefix(cfg.TavilyAPIKey, "env.") {
+		envVar := strings.TrimPrefix(cfg.TavilyAPIKey, "env.")
+		cfg.TavilyAPIKey = os.Getenv(envVar)
+	} else if cfg.TavilyAPIKey == "" {
+		cfg.TavilyAPIKey = os.Getenv("TAVILY_API_KEY")
+	}
+
 	tavilyClient := freshness.NewTavilyClient(
 		cfg.TavilyAPIKey,
 		cfg.DomainAllowlist,
@@ -656,6 +678,8 @@ func extractResponseInfo(ctx *schemas.BifrostContext, resp *schemas.BifrostRespo
 	// Infer or extract provider name
 	mLower := strings.ToLower(model)
 	switch {
+	case strings.Contains(mLower, "llama") || strings.Contains(mLower, "mixtral") || strings.Contains(mLower, "gemma") || strings.Contains(mLower, "groq"):
+		provider = "groq"
 	case strings.Contains(mLower, "gpt") || strings.Contains(mLower, "o1") || strings.Contains(mLower, "o3"):
 		provider = "openai"
 	case strings.Contains(mLower, "claude"):
@@ -663,7 +687,11 @@ func extractResponseInfo(ctx *schemas.BifrostContext, resp *schemas.BifrostRespo
 	case strings.Contains(mLower, "gemini"):
 		provider = "google"
 	default:
-		provider = "llm"
+		if os.Getenv("GROQ_API_KEY") != "" {
+			provider = "groq"
+		} else {
+			provider = "llm"
+		}
 	}
 
 	return text, model, provider, reqID, cacheID

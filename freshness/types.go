@@ -1,6 +1,8 @@
 package freshness
 
 import (
+	"os"
+	"strings"
 	"time"
 )
 
@@ -144,6 +146,17 @@ type Config struct {
 
 // DefaultConfig returns safe production defaults.
 func DefaultConfig() Config {
+	extractorModel := "groq/llama-3.3-70b-versatile"
+	if envModel := os.Getenv("GROQ_MODEL"); envModel != "" {
+		if !strings.HasPrefix(envModel, "groq/") {
+			extractorModel = "groq/" + envModel
+		} else {
+			extractorModel = envModel
+		}
+	} else if envModel := os.Getenv("EXTRACTOR_MODEL"); envModel != "" {
+		extractorModel = envModel
+	}
+
 	return Config{
 		Enabled:        true,
 		DogfoodLogPath: "logs/dogfood.jsonl",
@@ -155,7 +168,7 @@ func DefaultConfig() Config {
 			CategoryCompany,
 		},
 		TavilyAPIKey:   "",
-		ExtractorModel: "openai/gpt-4o-mini",
+		ExtractorModel: extractorModel,
 		FlagBelow:      0.50,
 		Limits: LimitsConfig{
 			MaxClaimsPerResponse:   8,
@@ -192,13 +205,20 @@ func DefaultConfig() Config {
 			CategoryRegulation: {"europa.eu", "ftc.gov", "sec.gov", "congress.gov"},
 		},
 		KnowledgeCutoffs: map[string]string{
-			"gpt-4o":              "2023-10-01",
-			"gpt-4o-mini":         "2023-10-01",
-			"gpt-4-turbo":         "2023-12-01",
-			"claude-3-5-sonnet":   "2024-04-01",
-			"claude-3-opus":       "2023-08-01",
-			"gemini-1.5-pro":      "2023-11-01",
-			"gemini-1.5-flash":    "2023-11-01",
+			"llama-3.3-70b-versatile": "2024-04-01",
+			"llama-3.1-70b-versatile": "2024-04-01",
+			"llama-3.1-8b-instant":    "2024-04-01",
+			"llama-3-70b-8192":        "2024-03-01",
+			"llama-3-8b-8192":         "2024-03-01",
+			"mixtral-8x7b-32768":      "2023-12-01",
+			"gemma2-9b-it":            "2024-05-01",
+			"gpt-4o":                  "2023-10-01",
+			"gpt-4o-mini":             "2023-10-01",
+			"gpt-4-turbo":             "2023-12-01",
+			"claude-3-5-sonnet":       "2024-04-01",
+			"claude-3-opus":           "2023-08-01",
+			"gemini-1.5-pro":          "2023-11-01",
+			"gemini-1.5-flash":        "2023-11-01",
 		},
 	}
 }
